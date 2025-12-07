@@ -14,5 +14,5 @@ Example of run for ML1M dataset:
 
 ```sh
 cd runs
-python run_pnfrec.py 
+python run_negbt.py 
 ```
