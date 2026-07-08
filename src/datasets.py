@@ -113,29 +113,25 @@ class CausalPredictionDataset(CausalDataset):
 
         user_id = self.user_ids[idx]
         item_sequence = self.items[user_id]
-        relevance_sequence = self.relevances[user_id]
-            
-        input_ids = np.array(item_sequence).astype(float)
-        positive_input_ids = input_ids[np.array(relevance_sequence) >= self.relevance_threshold].astype(int)
         
         item = {'user_id': user_id}
         
         if self.validation_mode:
-            item['target'] = positive_input_ids[-1]
+            item['target'] = item_sequence[-1]
             item['full_history'] = item_sequence[:-1]
-            
-            if self.positive_eval:
-                item['input_ids'] = positive_input_ids[-self.max_length - 1: -1]
-            else:
-                item['input_ids'] = item['full_history'][-self.max_length:]
-            
+            input_ids = np.array(item_sequence[:-1]).astype(float) 
+            item['target_rating'] = self.relevances[user_id][-1]
+            relevance_sequence = self.relevances[user_id][:-1]
         else:
             item['full_history'] = item_sequence
-            
-            if self.positive_eval:
-                item['input_ids'] = positive_input_ids[-self.max_length:]
-            else:
-                item['input_ids'] = item['full_history'][-self.max_length:]
+            input_ids = np.array(item_sequence).astype(float)
+            relevance_sequence = self.relevances[user_id]
+
+        if self.positive_eval:
+            positive_input_ids = input_ids[np.array(relevance_sequence) >= self.relevance_threshold].astype(int)
+            item['input_ids'] = positive_input_ids[-self.max_length:]
+        else:
+            item['input_ids'] = item['full_history'][-self.max_length:]
 
         return item     
     
@@ -251,6 +247,71 @@ class BarlowDataset(Dataset):
                 'labels': positive_labels}
 
         return item
+
+
+class BTSRDataset(Dataset):
+    """
+    BT-SR training dataset (barlow_twins_sasrec).
+
+    Full interaction sequence for CE; semantic augmentation uses another user's
+    prefix when the last item (target) matches.
+    """
+
+    padding_value = 0
+    labels_padding_value = -100
+
+    def __init__(self, df, max_length,
+                 user_col, item_col='item_id',
+                 time_col='time_idx', seed=42):
+        self.max_length = max_length
+        self.user_col = user_col
+        self.item_col = item_col
+        self.time_col = time_col
+        self.rng = np.random.RandomState(seed)
+        self._prepare_data(df)
+
+    def _prepare_data(self, df):
+        df = df.sort_values(self.time_col)
+        self.items = df.groupby(self.user_col)[self.item_col].agg(list).to_dict()
+        self.user_ids = [
+            uid for uid, seq in self.items.items() if len(seq) >= 2
+        ]
+        self.same_target_users = {}
+        target_to_users = {}
+        for uid in self.user_ids:
+            target = self.items[uid][-1]
+            target_to_users.setdefault(target, []).append(uid)
+        for uid in self.user_ids:
+            target = self.items[uid][-1]
+            self.same_target_users[uid] = [
+                u for u in target_to_users[target] if u != uid
+            ]
+
+    def __len__(self):
+        return len(self.user_ids)
+
+    def __getitem__(self, idx):
+        user_id = self.user_ids[idx]
+        user_items = np.array(self.items[user_id]).astype(int)
+        user_items = user_items[-self.max_length - 1:]
+        input_ids = user_items[:-1]
+        labels = user_items[1:]
+
+        aug_users = self.same_target_users[user_id]
+        if aug_users:
+            aug_uid = self.rng.choice(aug_users)
+        else:
+            aug_uid = user_id
+        aug_items = np.array(self.items[aug_uid]).astype(int)
+        aug_items = aug_items[-self.max_length - 1:]
+        aug_input_ids = aug_items[:-1]
+
+        return {
+            'user_id': user_id,
+            'input_ids': input_ids,
+            'labels': labels,
+            'aug_input_ids': aug_input_ids,
+        }
 
 
 class CausalNegativeFeedbackDataset(Dataset):
