@@ -18,6 +18,9 @@ dataloader:
 
 trainer_params:
   max_epochs: 100
+  accelerator: auto
+  devices: 1
+  strategy: auto
 
 patience: 10
 
