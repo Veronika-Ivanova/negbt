@@ -1,9 +1,10 @@
-import logging
 import os
-import random
 import sys
 
-import numpy as np
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(current_dir, '..', 'src')
+sys.path.insert(0, src_dir)
+
 import pandas as pd
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
@@ -12,17 +13,13 @@ from pytorch_lightning.loggers import CSVLogger
 import torch
 from torch.utils.data import DataLoader
 
-from datasets import (
-    PaddingCollateFn,
-    BarlowDataset,
-    CausalPredictionDataset,
-)
-from modules import SeqRec, SeqRecBarlow
-from models import SASRec, SASRecBarlow
+from datasets import PaddingCollateFn, BarlowDataset, CausalPredictionDataset
+from modules import SeqRecBarlow
+from models import SASRecBarlow
 from postprocess import preds2recs
-from preprocess import add_time_idx, prepare_splitted_data
+from preprocess import prepare_splitted_data
 from metrics import compute_metrics
-from utils import extract_validation_history, fix_seed
+from utils import fix_seed, get_csv_metrics_path
 
 cfg = OmegaConf.load("../runs/configs/NegBT_ml.yaml")
 
@@ -30,7 +27,6 @@ PROJECT_PATH = f"{cfg.project_path}"
 DATA_PATH = f"{PROJECT_PATH}{cfg.data_path}"
 
 USER_COL = f"{cfg.dataset.user_col}"
-ITEM_COL = f"{cfg.dataset.item_col}"
 RELEVANCE_COL = f"{cfg.dataset.relevance_col}"
 RELEVANCE_THRESHOLD = cfg.dataset.relevance_threshold
 MAX_LENGTH = cfg.dataset.max_length
@@ -52,7 +48,15 @@ power_coef = cfg.model.power_coef
 
 
 fix_seed(SEED)
-train, train_full, validation, test_pos, test_neg, last_item_pos, last_item_neg = prepare_splitted_data(
+(
+    train,
+    validation,
+    test,
+    last_pos_item_test,
+    last_pos_item_val,
+    last_neg_item_test,
+    last_neg_item_val,
+) = prepare_splitted_data(
     DATA_PATH,
     user_col=USER_COL,
     relevance_col=RELEVANCE_COL,
@@ -61,25 +65,24 @@ train, train_full, validation, test_pos, test_neg, last_item_pos, last_item_neg 
 )
 
 
-def get_eval_dataset(validation, validation_size=VALIDATION_SIZE):
-    validation_users = validation.user_id.unique()
-
-    if validation_size and (validation_size < len(validation_users)):
-        validation_users = np.random.choice(
-            validation_users, size=validation_size, replace=False
-        )
-
-    eval_dataset = CausalPredictionDataset(
-        validation[validation.user_id.isin(validation_users)],
+def get_eval_dataset(
+    validation,
+    last_pos_item_val,
+    last_neg_item_val,
+    validation_size=VALIDATION_SIZE,
+):
+    return CausalPredictionDataset(
+        validation,
         max_length=MAX_LENGTH,
         relevance_col=RELEVANCE_COL,
         relevance_threshold=RELEVANCE_THRESHOLD,
         user_col=USER_COL,
         validation_mode=True,
         positive_eval=only_positive,
+        last_pos_targets=last_pos_item_val,
+        last_neg_targets=last_neg_item_val,
+        validation_size=validation_size,
     )
-
-    return eval_dataset
 
 
 train_dataset = BarlowDataset(
@@ -89,9 +92,9 @@ train_dataset = BarlowDataset(
     relevance_col=RELEVANCE_COL,
     relevance_threshold=RELEVANCE_THRESHOLD,
 )
-eval_dataset = get_eval_dataset(validation)
+eval_dataset = get_eval_dataset(validation, last_pos_item_val, last_neg_item_val)
 
-collate_fn_train = PaddingCollateFn(add_aug_mask=True, labels_keys=['labels', 'aug_labels'])
+collate_fn_train = PaddingCollateFn(add_aug_mask=True, labels_keys=['labels'])
 collate_fn_val = PaddingCollateFn()
 
 train_loader = DataLoader(
@@ -100,7 +103,7 @@ train_loader = DataLoader(
     shuffle=True,
     num_workers=NUM_WORKERS,
     collate_fn=collate_fn_train,
-    persistent_workers=True
+    persistent_workers=True,
 )
 eval_loader = DataLoader(
     eval_dataset,
@@ -108,47 +111,32 @@ eval_loader = DataLoader(
     shuffle=False,
     num_workers=NUM_WORKERS,
     collate_fn=collate_fn_val,
-    persistent_workers=True
+    persistent_workers=True,
 )
 
-predict_pos_dataset = CausalPredictionDataset(
-    test_pos,
+predict_test_dataset = CausalPredictionDataset(
+    test,
     user_col=USER_COL,
     max_length=MAX_LENGTH,
     relevance_col=RELEVANCE_COL,
     relevance_threshold=RELEVANCE_THRESHOLD,
     positive_eval=only_positive,
 )
-predict_neg_dataset = CausalPredictionDataset(
-    test_neg,
-    user_col=USER_COL,
-    max_length=MAX_LENGTH,
-    relevance_col=RELEVANCE_COL,
-    relevance_threshold=RELEVANCE_THRESHOLD,
-    positive_eval=only_positive,
-)
-predict_pos_loader = DataLoader(
-    predict_pos_dataset,
+predict_test_loader = DataLoader(
+    predict_test_dataset,
     batch_size=TEST_BATCH_SIZE,
     shuffle=False,
     num_workers=NUM_WORKERS,
     collate_fn=collate_fn_val,
-    persistent_workers=True
-)
-predict_neg_loader = DataLoader(
-    predict_neg_dataset,
-    batch_size=TEST_BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    collate_fn=collate_fn_val,
-    persistent_workers=True
+    persistent_workers=True,
 )
 
 item_count = train.item_id.max()
 add_head = True
 
+
 def main(cfg):
-    logger = CSVLogger("", name="metrics.csv")
+    logger = CSVLogger("", name="metrics_negbt")
     fix_seed(SEED)
     model = SASRecBarlow(
         item_num=item_count,
@@ -160,21 +148,22 @@ def main(cfg):
         num_blocks=num_blocks,
     )
 
-    fix_seed(SEED)
-    seqrec_module = SeqRecBarlow(model,
-                                 lr=lr,
-                                 predict_top_k=10,
-                                 filter_seen=True,
-                                 barlow_coeff=barlow_coeff, 
-                                 off_diag_coeff=off_diag_coeff, 
-                                 power_coef=power_coef)
-    early_stopping = EarlyStopping(
-        monitor="val_ndcg", mode="max", patience=10, verbose=False
+    seqrec_module = SeqRecBarlow(
+        model,
+        lr=lr,
+        predict_top_k=10,
+        filter_seen=True,
+        barlow_coeff=barlow_coeff,
+        off_diag_coeff=off_diag_coeff,
+        power_coef=power_coef,
     )
 
+    early_stopping = EarlyStopping(
+        monitor="val_ndcg_pos", mode="max", patience=cfg.patience, verbose=False
+    )
     model_summary = ModelSummary(max_depth=2)
     checkpoint = ModelCheckpoint(
-        save_top_k=1, monitor="val_ndcg", mode="max", save_weights_only=True
+        save_top_k=1, monitor="val_ndcg_pos", mode="max", save_weights_only=True
     )
     callbacks = [early_stopping, model_summary, checkpoint]
 
@@ -182,9 +171,10 @@ def main(cfg):
         logger=logger,
         callbacks=callbacks,
         enable_checkpointing=True,
-        accelerator="auto",  # Specify the accelerator type
-        devices="auto",
-        max_epochs=100,
+        accelerator=cfg.trainer_params.get("accelerator", "auto"),
+        devices=cfg.trainer_params.get("devices", 1),
+        strategy=cfg.trainer_params.get("strategy", "auto"),
+        max_epochs=cfg.trainer_params.max_epochs,
         deterministic=True,
     )
 
@@ -197,33 +187,23 @@ def main(cfg):
     seqrec_module.load_state_dict(
         torch.load(checkpoint.best_model_path)["state_dict"]
     )
-    history = pd.read_csv(os.path.join(trainer.logger.experiment.log_dir, 'metrics.csv'))
-    val_metrics = {
-        "val_ndcg": history["val_ndcg"].max(),
-        "val_hit_rate": history["val_hit_rate"].max(),
-        "val_mrr": history["val_mrr"].max(),
-    }
+    history = pd.read_csv(get_csv_metrics_path(trainer))
+    print({
+        "val_ndcg_pos": history["val_ndcg_pos"].max(),
+        "val_hit_rate_pos": history["val_hit_rate_pos"].max(),
+        "val_mrr_pos": history["val_mrr_pos"].max(),
+    })
 
-    seqrec_module.predict_top_k = 10
-    seqrec_module.filter_seen = True
-    preds_pos = trainer.predict(model=seqrec_module, dataloaders=predict_pos_loader)
-    preds_neg = trainer.predict(model=seqrec_module, dataloaders=predict_neg_loader)
-    recs_pos = preds2recs(preds_pos)
-    recs_neg = preds2recs(preds_neg)
-
+    preds_test = trainer.predict(model=seqrec_module, dataloaders=predict_test_loader)
+    recs_test = preds2recs(preds_test)
     metrics = compute_metrics(
-        last_item_pos,
-        last_item_neg,
-        recs_pos,
-        recs_neg,
-        train_full,
-        relevance_col=RELEVANCE_COL,
-        relevance_threshold=RELEVANCE_THRESHOLD,
+        last_pos_item_test,
+        last_neg_item_test,
+        recs_test,
+        train,
     )
-    
     print(metrics)
 
 
 if __name__ == "__main__":
-
     main(cfg)
