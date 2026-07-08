@@ -48,11 +48,23 @@ def get_csv_metrics_path(trainer, filename='metrics.csv'):
 
     if hasattr(logger, 'log_dir'):
         log_dir = logger.log_dir
-        if not callable(log_dir):
-            return os.path.join(log_dir, filename)
+        if callable(log_dir):
+            log_dir = log_dir()
+    else:
+        experiment = logger.experiment
+        log_dir = experiment.log_dir
+        if callable(log_dir):
+            log_dir = log_dir()
 
-    experiment = logger.experiment
-    log_dir = experiment.log_dir
-    if callable(log_dir):
-        log_dir = log_dir()
-    return os.path.join(log_dir, filename)
+    path = os.path.join(log_dir, filename)
+    if os.path.isfile(path):
+        return path
+
+    # CSVLogger always writes metrics.csv regardless of logger name.
+    default_path = os.path.join(log_dir, 'metrics.csv')
+    if os.path.isfile(default_path):
+        return default_path
+
+    raise FileNotFoundError(
+        f'No metrics CSV found in {log_dir} (tried {filename!r} and metrics.csv)'
+    )
