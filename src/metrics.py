@@ -4,35 +4,77 @@ Metrics.
 import numpy as np
 import pandas as pd
 import torch
-from recommenders.evaluation.python_evaluation import map_at_k, ndcg_at_k, recall_at_k
 from tqdm.auto import tqdm
 
 
-def compute_metrics(last_item_pos,
-    last_item_neg,
-    preds_pos,
-    preds_neg, train_full, relevance_col,
-                    relevance_threshold, k=10):
+def compute_metrics(last_pos_item_test,
+                    last_neg_item_test,
+                    recs,
+                    train,
+                    user_col='user_id',
+                    item_col='item_id'):
+    recs_list = (recs
+                 .rename(columns={'user_id': user_col})
+                 .groupby(user_col)[item_col]
+                 .agg(lambda x: list(x))
+                 .reset_index()
+                 .rename(columns={item_col: 'item_ids'}))
     
-    # when we have 1 true positive, HitRate == Recall and MRR == MAP
     metrics_dict = {
-        f'NDCG_p': round(ndcg_at_k(last_item_pos, preds_pos, col_user='user_id', col_item='item_id',
-                             col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'HR_p': round(recall_at_k(last_item_pos, preds_pos, col_user='user_id', col_item='item_id',
-                             col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'MRR_p': round(map_at_k(last_item_pos, preds_pos, col_user='user_id', col_item='item_id',
-                           col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'NDCG_n': round(ndcg_at_k(last_item_neg, preds_neg, col_user='user_id', col_item='item_id',
-                             col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'HR_n': round(recall_at_k(last_item_neg, preds_neg, col_user='user_id', col_item='item_id',
-                             col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'MRR_n': round(map_at_k(last_item_neg, preds_neg, col_user='user_id', col_item='item_id',
-                           col_prediction='prediction', col_rating=relevance_col, k=k), 6),
-        f'Coverage': round(pd.concat([preds_pos, preds_neg]).item_id.nunique() / train_full.item_id.nunique(), 6),
-    }
+                    'HR_p': hr(last_pos_item_test, recs_list, user_col, item_col),
+                    'MRR_p': mrr(last_pos_item_test, recs_list, user_col, item_col),
+                    'NDCG_p': ndcg(last_pos_item_test, recs_list, user_col, item_col),
+                    'HR_n': hr(last_neg_item_test, recs_list, user_col, item_col),
+                    'MRR_n': mrr(last_neg_item_test, recs_list, user_col, item_col),
+                    'NDCG_n': ndcg(last_neg_item_test, recs_list, user_col, item_col)}
     
-    metrics_dict['HR_diff'] = round(metrics_dict['HR_p'] - metrics_dict['HR_n'], 6)
-    metrics_dict['MRR_diff'] = round(metrics_dict['MRR_p'] - metrics_dict['MRR_n'], 6)
-    metrics_dict['NDCG_diff'] = round(metrics_dict['NDCG_p'] - metrics_dict['NDCG_n'], 6)
-
+    metrics_dict['coverage'] = coverage(recs, train, item_col)
     return metrics_dict
+
+def hr(
+    ground_truth: pd.DataFrame,
+    recs_list: pd.DataFrame,
+    user_col='user_id',
+    item_col='item_id',
+) -> float:
+    df = ground_truth.merge(recs_list, on=user_col, how='inner')
+    hr_values = []
+    for _, row in df.iterrows():
+        hr_values.append(int(row[item_col] in row['item_ids']))
+    return round(np.mean(hr_values), 6)
+
+def mrr(
+    ground_truth: pd.DataFrame,
+    recs_list: pd.DataFrame,
+    user_col='user_id',
+    item_col='item_id'
+) -> float:
+    df = ground_truth.merge(recs_list, on=user_col, how='inner')
+    mrr_values = []
+    for _, row in df.iterrows():
+        try:
+            user_mrr = 1 / (row['item_ids'].index(row[item_col]) + 1)
+        except ValueError:
+            user_mrr = 0
+        mrr_values.append(user_mrr)
+    return round(np.mean(mrr_values), 6)
+
+def ndcg(
+    ground_truth: pd.DataFrame,
+    recs_list: pd.DataFrame,
+    user_col='user_id',
+    item_col='item_id'
+) -> float:
+    # ideal dcg == 1 при стратегии разделения leave-one-out
+    df = ground_truth.merge(recs_list, on=user_col, how='inner')
+    ndcg_values = []
+    for _, row in df.iterrows():
+        try:
+            user_ndcg = 1 / np.log2(row['item_ids'].index(row[item_col]) + 2)
+        except ValueError:
+            user_ndcg = 0
+        ndcg_values.append(user_ndcg)
+    return round(np.mean(ndcg_values), 6)
+
+def coverage(recs: pd.DataFrame, train: pd.DataFrame, item_col='item_id') -> float:
+    return round(recs[item_col].nunique() / train[item_col].nunique(), 6)
